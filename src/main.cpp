@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <HTTPClient.h>
+#include <JPEGDEC.h>
 #include <ESPmDNS.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
@@ -258,7 +259,6 @@ class ThumbDecoder {
 #define HTTP_TIMEOUT_MS    4000
 #define UI_W               232              // 內部畫布邊長（邏輯像素）。圓形介面以 (116,116) 為圓心、半徑 116
 #define UI_OUT             464              // 輸出邊長 = 畫布 x 2（整數倍），剛好填滿 466 的圓形面板
-#define UI_SMOOTH          1                // 1 = 雙線性放大（字比較柔）；0 = 最近鄰（字有顆粒感但最銳利，也比較快）
 #define UI_FPS_MS          30               // 推送畫面的最短間隔（毫秒）
 #define FLOW_EFFECT        1                // 外圈流水特效，0 = 關閉
 #define FLOW_MS            40               // 流水每幀間隔（毫秒），越小越流暢但越吃 CPU
@@ -288,6 +288,7 @@ WebServer web(80);
 WiFiManager wm;
 
 String printerHost;            // 例如 "192.168.0.102:7125"
+String camUrl;                 // 鏡頭快照網址；留空 = 自動偵測
 int brightPct = 100;           // 螢幕背光亮度 5~100 (%)
 int bgLevel = 70;              // 背景數字亮度 0~255
 int pollSec = POLL_DEFAULT_SEC;  // 資料更新週期 1~30 秒
@@ -295,6 +296,13 @@ int rotation = 0;              // 畫面旋轉 0~3（每格 90°）
 
 static bool uiDirty = true;    // 畫布有變動，等著推到螢幕
 static inline void markDirty() { uiDirty = true; }
+
+// ---- 頁面：0 = 主畫面、1 = 鏡頭、2 = 設定；左右滑動換頁 ----
+enum UiPage { PG_DASH, PG_CAM, PG_SET };
+static UiPage uiPage = PG_DASH;
+static bool camShowing = false;   // 鏡頭畫面正在直接推到螢幕（這時不要推 UI 畫布）
+static bool uiFast = false;       // 拖曳 / 捲動時用最近鄰放大（快），停下來再補一次雙線性
+static bool setDirty = true;      // 設定頁需要重畫
 
 // ---- 列印檔縮圖 ----
 #define THUMB_W    72
@@ -345,6 +353,7 @@ void loadConfig() {
         bgLevel = constrain((int)(d["bg"] | 70), 0, 200);
         pollSec = constrain((int)(d["poll"] | POLL_DEFAULT_SEC), 1, 30);
         rotation = constrain((int)(d["rot"] | 0), 0, 3);
+        camUrl = String((const char *)(d["cam"] | ""));
       }
       f.close();
     }
@@ -367,6 +376,7 @@ void saveConfig() {
   d["bg"] = bgLevel;
   d["poll"] = pollSec;
   d["rot"] = rotation;
+  d["cam"] = camUrl;
   serializeJson(d, f);
   f.close();
 }
@@ -493,27 +503,34 @@ static inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
 // 232x232 畫布 → 放大成 UI_OUT x UI_OUT（2 倍）→ 依 rotation 轉向 → 置中推到 466x466 面板
 struct AxisMap { uint16_t i0, i1; uint8_t w; };   // w：給 i1 的權重 0~32
 static AxisMap axisMap[UI_OUT];
-static uint16_t *outBuf = nullptr;
+static uint16_t axisNear[UI_OUT];
+static uint16_t *outBuf = nullptr;                // 466x466，UI 和鏡頭畫面共用
+static bool needSmooth = false;
+static unsigned long lastFastMs = 0;
 
 static bool presentInit() {
   for (int d = 0; d < UI_OUT; d++) {
-#if UI_SMOOTH
     float f = (d + 0.5f) * UI_W / UI_OUT - 0.5f;
     if (f < 0) f = 0;
     if (f > UI_W - 1) f = UI_W - 1;
     int i0 = (int)f, i1 = i0 < UI_W - 1 ? i0 + 1 : i0;
     axisMap[d] = { (uint16_t)i0, (uint16_t)i1, (uint8_t)((f - i0) * 32.0f + 0.5f) };
-#else
-    int i0 = (int)((long)d * UI_W / UI_OUT);
-    axisMap[d] = { (uint16_t)i0, (uint16_t)i0, 0 };
-#endif
+    axisNear[d] = (uint16_t)((long)d * UI_W / UI_OUT);
   }
-  outBuf = (uint16_t *)heap_caps_malloc((size_t)UI_OUT * UI_OUT * 2, MALLOC_CAP_SPIRAM);
-  if (!outBuf) outBuf = (uint16_t *)malloc((size_t)UI_OUT * UI_OUT * 2);
+  outBuf = (uint16_t *)heap_caps_malloc((size_t)PANEL_W * PANEL_H * 2, MALLOC_CAP_SPIRAM);
+  if (!outBuf) outBuf = (uint16_t *)malloc((size_t)PANEL_W * PANEL_H * 2);
   return outBuf != nullptr;
 }
 
-static void present() {
+// 把整個面板塗黑（切換到鏡頭畫面或離開時用）
+static void clearPanel() {
+  if (!outBuf) return;
+  memset(outBuf, 0, (size_t)PANEL_W * PANEL_H * 2);
+  panelPush(0, 0, PANEL_W, PANEL_H, outBuf);
+}
+
+// fast = 最近鄰（捲動 / 拖曳時用，約快 3 倍）；否則雙線性
+static void present(bool fast = false) {
   uiDirty = false;
   if (!outBuf) return;
   const uint16_t *src = (const uint16_t *)tft.getPointer();   // TFT_eSprite 的 16 位元像素是高低位元組對調存放的
@@ -529,6 +546,10 @@ static void present() {
         case 3:  ix = S - 1 - dy; iy = dx;         break;
         default: ix = dx;         iy = dy;         break;
       }
+      if (fast) {
+        *o++ = __builtin_bswap16(src[axisNear[iy] * UI_W + axisNear[ix]]);
+        continue;
+      }
       const AxisMap &mx = axisMap[ix], &my = axisMap[iy];
       const uint16_t *r0 = src + my.i0 * UI_W, *r1 = src + my.i1 * UI_W;
       uint16_t a = __builtin_bswap16(r0[mx.i0]), b = __builtin_bswap16(r0[mx.i1]);
@@ -537,15 +558,21 @@ static void present() {
     }
   }
   panelPush((PANEL_W - S) / 2, (PANEL_H - S) / 2, S, S, outBuf);
+  needSmooth = fast;
+  lastFastMs = millis();
 }
 
 static void presentIfDirty() {
+  if (uiPage == PG_CAM && camShowing) return;   // 鏡頭畫面由 camPresent 直接推
   static unsigned long last = 0;
-  if (!uiDirty) return;
   unsigned long now = millis();
-  if (now - last < UI_FPS_MS) return;
-  last = now;
-  present();
+  if (uiDirty) {
+    if (now - last < UI_FPS_MS) return;
+    last = now;
+    present(uiFast);
+  } else if (needSmooth && !uiFast && now - lastFastMs > 150) {
+    present(false);   // 拖曳結束後補一張清晰的
+  }
 }
 
 // 透明背景文字（只畫字，不填底色）：疊在背景大數字上用
@@ -622,6 +649,15 @@ static void drawSeg7Digit(int d, int x, int y, int w, int h, int t, uint16_t col
   if (m & 0x40) segH(xl + e, xr - e, mid, t, col);       // g 中
 }
 
+// 頁面指示點（三個點，目前這頁是白色大點）
+static void drawPageDots(int active) {
+  for (int i = 0; i < 3; i++) {
+    int x = UI_CX + (i - 1) * 12;
+    if (i == active) tft.fillCircle(x, 212, 3, C_WHITE);
+    else tft.fillCircle(x, 212, 2, mix565(C_BG, C_GREY, 110));
+  }
+}
+
 static void drawBgNumber() {
   if (bgNum < 0) return;
   uint16_t col = mix565(C_BG, C_WHITE, bgLevel);
@@ -655,11 +691,10 @@ static void drawNoHost() {
   tft.fillScreen(C_BG);
   String ip = WiFi.localIP().toString();
   text("WiFi connected", UI_CX, 42, 4, C_GREEN, C_BG, TC_DATUM);
-  text("Open in browser:", UI_CX, 78, 2, C_GREY, C_BG, TC_DATUM);
-  text(ip, UI_CX, 98, tft.textWidth(ip, 4) <= 170 ? 4 : 2, C_WHITE, C_BG, TC_DATUM);
-  text("or " MDNS_NAME ".local", UI_CX, 130, 2, C_GREY, C_BG, TC_DATUM);
-  text("Then enter the", UI_CX, 158, 2, C_GREY, C_BG, TC_DATUM);
-  text("printer IP", UI_CX, 176, 2, C_GREY, C_BG, TC_DATUM);
+  text("Set the printer IP:", UI_CX, 80, 2, C_GREY, C_BG, TC_DATUM);
+  text("Swipe left", UI_CX, 100, 4, C_WHITE, C_BG, TC_DATUM);
+  text("to open SETTINGS", UI_CX, 134, 2, C_GREY, C_BG, TC_DATUM);
+  text(ip, UI_CX, 168, 2, C_GREY, C_BG, TC_DATUM);
 }
 
 static void drawWifiLost() {
@@ -784,6 +819,7 @@ static void composeContent() {
   tft.fillCircle(UI_CX, UI_CY, (int)RING_R - RING_PEN - 1, C_BG);
   drawBgNumber();
   drawForeground();
+  drawPageDots(0);
   markDirty();
 }
 
@@ -1158,7 +1194,623 @@ static void doPoll() {
     cur.stateColor = C_RED;
     cur.etaS = -1;
   }
-  renderDash();
+  if (uiPage == PG_DASH) renderDash();             // 不在主畫面時只更新資料，回到主畫面再整張重畫
+  else if (uiPage == PG_SET) setDirty = true;      // 設定頁的外圈進度條跟著更新
+}
+
+// ====================== 頁面 / 觸控 / 設定頁 / 鏡頭 ======================
+// 旋轉畫面：輸出時轉向（見 present），再把目前的頁面重畫
+static void applyRotation(int r) {
+  rotation = constrain(r, 0, 3);
+  markDirty();
+  if (uiPage == PG_DASH) {
+    Screen sc = screen;
+    screen = SCR_NONE;
+    if (sc != SCR_NONE) {
+      setScreen(sc);
+      if (sc == SCR_DASH) renderDash();
+    }
+  } else if (uiPage == PG_SET) {
+    setDirty = true;
+  }
+}
+
+// 非主畫面的頁面也畫外圈：底軌 + 目前的列印進度
+static void drawRingStatic() {
+  drawRing(0, RING_TOTAL, C_TRACK);
+  float len = constrain(cur.progress, 0.0f, 1.0f) * RING_TOTAL;
+  if (len > 0) drawRing(0, len, cur.stateColor);
+}
+
+// ---------------- 設定頁 ----------------
+// 項目：印表機位址、亮度、背景數字亮度、更新週期、旋轉、測試連線、重置 WiFi（跟原本網頁一樣）
+enum { ST_HOST, ST_BRIGHT, ST_BG, ST_POLL, ST_ROT, ST_TEST, ST_RESET, ST_N };
+static const int stH[ST_N] = { 34, 40, 40, 40, 40, 36, 30 };
+#define ST_GAP 4
+#define SV_X 44   // 可視區（圓內最寬的一段）
+#define SV_Y 52
+#define SV_W 144
+#define SV_H 138
+#define SR_X 56   // 每一列的位置與寬度
+#define SR_W 120
+static int setScroll = 0;
+static String testMsg = "";
+static bool testOk = true;
+static unsigned long resetArm = 0;
+static bool kbOpen = false;
+static String kbBuf = "";
+static String kbErr = "";
+static unsigned long kbErrUntil = 0;
+
+static int stTotal() { int t = 8; for (int i = 0; i < ST_N; i++) t += stH[i] + ST_GAP; return t; }
+static int stMaxScroll() { int m = stTotal() - SV_H; return m > 0 ? m : 0; }
+static int stTop(int i) { int y = SV_Y + 4 - setScroll; for (int j = 0; j < i; j++) y += stH[j] + ST_GAP; return y; }
+
+static void sliderRange(int row, int &mn, int &mx) {
+  if (row == ST_BRIGHT) { mn = 5; mx = 100; }
+  else if (row == ST_BG) { mn = 0; mx = 200; }
+  else { mn = 1; mx = 30; }
+}
+static int sliderValue(int row) { return row == ST_BRIGHT ? brightPct : row == ST_BG ? bgLevel : pollSec; }
+static void sliderSet(int row, int v) {
+  if (row == ST_BRIGHT) setBacklight(v);
+  else if (row == ST_BG) bgLevel = constrain(v, 0, 200);
+  else { pollSec = constrain(v, 1, 30); nextPoll = millis() + (unsigned long)pollSec * 1000UL; }
+}
+
+static void drawSliderRow(int row, const char *label, const String &val) {
+  int y = stTop(row);
+  gRRect(SR_X, y, SR_W, stH[row], 8, C_CARDSOLID);
+  gText(label, SR_X + 8, y + 4, 2, C_WHITE);
+  gText(val, SR_X + SR_W - 8, y + 4, 2, C_GREY, TR_DATUM);
+  int mn, mx;
+  sliderRange(row, mn, mx);
+  int tx0 = SR_X + 10, tw = SR_W - 20, ty = y + 27;
+  int kx = tx0 + (int)((long)(sliderValue(row) - mn) * tw / (mx - mn));
+  gRRect(tx0, ty, tw, 6, 3, C_TRACK);
+  if (kx - tx0 >= 6) gRRect(tx0, ty, kx - tx0, 6, 3, C_GREEN);
+  gCircle(kx, ty + 3, 6, C_WHITE);
+}
+
+static void drawKeypad();
+
+static void renderSettings() {
+  setDirty = false;
+  tft.fillScreen(C_BG);
+  drawRingStatic();
+  if (kbOpen) { drawKeypad(); markDirty(); return; }
+  gText("SETTINGS", UI_CX, 28, 2, C_WHITE, TC_DATUM);
+  tft.setViewport(SV_X, SV_Y, SV_W, SV_H, false);   // 超出可視區的列直接被裁掉（捲動用）
+  {  // 印表機位址
+    int y = stTop(ST_HOST);
+    gRRect(SR_X, y, SR_W, stH[ST_HOST], 8, C_CARDSOLID);
+    gText("PRINTER", SR_X + 8, y + 4, 1, C_GREY);
+    String hv = printerHost;
+    if (hv.endsWith(":7125")) hv.remove(hv.length() - 5);
+    bool has = hv.length() > 0;
+    if (!has) hv = "tap to set";
+    int f = tft.textWidth(hv, 2) <= SR_W - 16 ? 2 : 1;
+    gText(hv, SR_X + 8, y + (f == 2 ? 15 : 19), f, has ? C_WHITE : C_AMBER);
+  }
+  drawSliderRow(ST_BRIGHT, "BRIGHT", String(brightPct) + "%");
+  drawSliderRow(ST_BG, "DIGITS", String(bgLevel));
+  drawSliderRow(ST_POLL, "POLL", String(pollSec) + " s");
+  {  // 旋轉
+    int y = stTop(ST_ROT);
+    gRRect(SR_X, y, SR_W, stH[ST_ROT], 8, C_CARDSOLID);
+    gText("ROTATE", SR_X + 8, y + 4, 2, C_WHITE);
+    static const char *deg[4] = { "0", "90", "180", "270" };
+    for (int i = 0; i < 4; i++) {
+      int bx = SR_X + 7 + i * 27, by = y + 22;
+      bool on = (i == rotation);
+      gRRect(bx, by, 25, 14, 5, on ? C_GREEN : C_TRACK);
+      gText(deg[i], bx + 12, by + 3, 1, on ? C_BG : C_WHITE, TC_DATUM);
+    }
+  }
+  {  // 測試連線
+    int y = stTop(ST_TEST);
+    gRRect(SR_X, y, SR_W, stH[ST_TEST], 8, C_CARDSOLID);
+    if (testMsg.length() == 0) {
+      gText("TEST CONNECTION", SR_X + SR_W / 2, y + 14, 1, C_WHITE, TC_DATUM);
+    } else {
+      gText("TEST CONNECTION", SR_X + SR_W / 2, y + 6, 1, C_GREY, TC_DATUM);
+      String m = testMsg;
+      while (m.length() > 1 && tft.textWidth(m, 1) > SR_W - 12) m.remove(m.length() - 1);
+      gText(m, SR_X + SR_W / 2, y + 20, 1, testOk ? C_GREEN : C_RED, TC_DATUM);
+    }
+  }
+  {  // 重置 WiFi（要點兩次）
+    int y = stTop(ST_RESET);
+    bool armed = resetArm && millis() < resetArm;
+    gRRect(SR_X, y, SR_W, stH[ST_RESET], 8, armed ? C_RED : C_CARDSOLID);
+    gText(armed ? "TAP AGAIN" : "RESET WIFI", SR_X + SR_W / 2, y + 7, 2, armed ? C_WHITE : C_RED, TC_DATUM);
+  }
+  tft.resetViewport();
+  if (setScroll > 0) tft.fillTriangle(UI_CX - 5, 50, UI_CX + 5, 50, UI_CX, 45, C_GREY);                  // 上面還有
+  if (setScroll < stMaxScroll()) tft.fillTriangle(UI_CX - 5, 195, UI_CX + 5, 195, UI_CX, 200, C_GREY);   // 下面還有
+  drawPageDots(2);
+  markDirty();
+}
+
+// ---- 數字鍵盤（輸入印表機位址）----
+#define KB_X 56
+#define KB_Y 70
+#define KB_W 28
+#define KB_H 26
+#define KB_G 3
+static const char KB_KEYS[4][4] = { { '1', '2', '3', '<' }, { '4', '5', '6', ':' }, { '7', '8', '9', '.' }, { '0', 'X', 'K', 'K' } };
+
+// 回傳該位置的按鍵，沒有就回傳 0；OK 鍵佔最後一列的兩格
+static char kbHit(int lx, int ly, int *kx = nullptr, int *ky = nullptr, int *kw = nullptr) {
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      char k = KB_KEYS[r][c];
+      if (k == 'K' && c == 3) continue;
+      int x = KB_X + c * (KB_W + KB_G), y = KB_Y + r * (KB_H + KB_G);
+      int w = (k == 'K') ? 2 * KB_W + KB_G : KB_W;
+      if (kx) { *kx = x; *ky = y; *kw = w; }
+      if (lx >= x - 1 && lx < x + w + 1 && ly >= y - 1 && ly < y + KB_H + 1) return k;
+    }
+  return 0;
+}
+
+static void drawKeypad() {
+  gRRect(56, 44, 120, 22, 6, C_CARDSOLID);
+  String shown = kbBuf;
+  uint16_t col = C_WHITE;
+  if (kbErr.length() && millis() < kbErrUntil) { shown = kbErr; col = C_RED; }
+  else if (shown.length() == 0) { shown = "IP address"; col = C_GREY; }
+  while (shown.length() > 1 && tft.textWidth(shown, 2) > 112) shown.remove(0, 1);   // 太長只顯示尾巴
+  gText(shown, UI_CX, 48, 2, col, TC_DATUM);
+  for (int r = 0; r < 4; r++)
+    for (int c = 0; c < 4; c++) {
+      char k = KB_KEYS[r][c];
+      if (k == 'K' && c == 3) continue;
+      int x = KB_X + c * (KB_W + KB_G), y = KB_Y + r * (KB_H + KB_G);
+      int w = (k == 'K') ? 2 * KB_W + KB_G : KB_W;
+      uint16_t bg = C_CARDSOLID, fg = C_WHITE;
+      const char *lab;
+      char one[2] = { k, 0 };
+      lab = one;
+      if (k == 'K') { bg = C_GREEN; fg = C_BG; lab = "OK"; }
+      else if (k == 'X') { bg = RGB565(120, 40, 50); lab = "X"; }
+      else if (k == '<') { bg = C_TRACK; }
+      else if (k == ':' || k == '.') { bg = C_TRACK; }
+      gRRect(x, y, w, KB_H, 6, bg);
+      gText(lab, x + w / 2, y + 5, 2, fg, TC_DATUM);
+    }
+}
+
+// 連線測試（會等最多 3 秒）；結果顯示在「TEST CONNECTION」那一列
+static void runTest() {
+  if (printerHost.length() == 0) { testMsg = "Set printer IP first"; testOk = false; return; }
+  testMsg = "Testing...";
+  testOk = true;
+  renderSettings();
+  present();
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(3000);
+  if (http.begin(c, "http://" + printerHost + "/printer/info") && http.GET() == 200) {
+    JsonDocument d;
+    if (!deserializeJson(d, http.getString())) {
+      testOk = true;
+      testMsg = String("OK ") + (const char *)(d["result"]["hostname"] | "?");
+    } else {
+      testOk = false;
+      testMsg = "Not Moonraker";
+    }
+  } else {
+    testOk = false;
+    testMsg = "No reply";
+  }
+  http.end();
+}
+
+static void kbTap(int lx, int ly) {
+  char k = kbHit(lx, ly);
+  if (!k) return;
+  if (k == '<') { if (kbBuf.length()) kbBuf.remove(kbBuf.length() - 1); }
+  else if (k == 'X') { kbOpen = false; }
+  else if (k == 'K') {
+    String h, err;
+    if (normalizeHost(kbBuf, h, err)) {
+      printerHost = h;
+      saveConfig();
+      failCount = 0;
+      nextPoll = 0;   // 立刻重新輪詢
+      kbOpen = false;
+      testMsg = "";
+      renderSettings();
+      present();
+      runTest();
+    } else {
+      kbErr = "Invalid address";
+      kbErrUntil = millis() + 1500;
+    }
+  } else if (kbBuf.length() < 24) kbBuf += k;
+  setDirty = true;
+}
+
+static int sliderHit(int lx, int ly) {
+  if (lx < SR_X || lx >= SR_X + SR_W || ly < SV_Y || ly >= SV_Y + SV_H) return -1;
+  for (int row = ST_BRIGHT; row <= ST_POLL; row++) {
+    int y = stTop(row);
+    if (ly >= y + 16 && ly < y + stH[row]) return row;   // 只有下半部（滑軌附近）算滑塊，上半部可以拿來捲動
+  }
+  return -1;
+}
+
+static void sliderDrag(int row, int lx) {
+  int mn, mx;
+  sliderRange(row, mn, mx);
+  int tx0 = SR_X + 10, tw = SR_W - 20;
+  int v = mn + (int)((long)(lx - tx0) * (mx - mn) / tw);
+  sliderSet(row, constrain(v, mn, mx));
+  setDirty = true;
+}
+
+static void settingsTap(int lx, int ly) {
+  if (lx < SR_X || lx >= SR_X + SR_W || ly < SV_Y || ly >= SV_Y + SV_H) return;
+  for (int i = 0; i < ST_N; i++) {
+    int y = stTop(i);
+    if (ly < y || ly >= y + stH[i]) continue;
+    switch (i) {
+      case ST_HOST:
+        kbOpen = true;
+        kbBuf = printerHost;
+        if (kbBuf.endsWith(":7125")) kbBuf.remove(kbBuf.length() - 5);
+        kbErr = "";
+        break;
+      case ST_ROT:
+        for (int k = 0; k < 4; k++) {
+          int bx = SR_X + 7 + k * 27;
+          if (lx >= bx - 1 && lx < bx + 26 && ly >= y + 18) { applyRotation(k); saveConfig(); }
+        }
+        break;
+      case ST_TEST: runTest(); break;
+      case ST_RESET:
+        if (resetArm && millis() < resetArm) {
+          tft.fillScreen(C_BG);
+          text("Resetting WiFi...", UI_CX, 108, 2, C_WHITE, C_BG, TC_DATUM);
+          present();
+          delay(400);
+          wm.resetSettings();
+          ESP.restart();
+        }
+        resetArm = millis() + 3000;
+        break;
+    }
+    setDirty = true;
+    return;
+  }
+}
+
+// ---------------- 鏡頭 ----------------
+// 背景工作不斷抓印表機鏡頭的 JPEG 快照 → JPEGDEC 縮小解碼 → 主迴圈放大成 466 寬推到螢幕
+static JPEGDEC jpeg;
+static volatile bool camWanted = false;
+static volatile int camRev = 0;                 // 網址設定改了就加 1，叫鏡頭工作重新找
+static uint8_t *camJpg = nullptr;
+static const size_t CAM_JPG_CAP = 400 * 1024;
+static uint16_t *camBuf[2] = { nullptr, nullptr };
+static size_t camBufCap = 0;                    // 每個緩衝可放幾個像素
+static volatile int camReady = -1;              // 最新一張完成的緩衝（0 或 1）
+static volatile int camW = 0, camH = 0;
+static volatile uint32_t camSeq = 0;
+static uint32_t camShownSeq = 0;
+static unsigned long camLastFrame = 0;
+static char camStatus[28] = "";
+static SemaphoreHandle_t camMux = nullptr;
+static String camResolved;                      // 找到、可以用的快照網址（只有鏡頭工作會動它）
+static int camDecIdx = 0, camDecW = 0, camDecH = 0;
+
+static void camSetStatus(const char *t) { strlcpy(camStatus, t, sizeof camStatus); }
+
+// 各種寫法的網址 → 完整網址（127.0.0.1 / localhost 換成印表機 IP）
+static String camAbs(String u, const String &ip) {
+  u.trim();
+  if (u.startsWith("http")) { u.replace("127.0.0.1", ip); u.replace("localhost", ip); return u; }
+  if (u.startsWith("//")) return "http:" + u;
+  if (u.startsWith("/") || u.startsWith(":")) return "http://" + ip + u;
+  return "http://" + ip + "/" + u;
+}
+
+// 這個網址回傳的是不是 JPEG（串流網址開頭是 multipart 邊界，會被擋掉）
+static bool camProbe(const String &url) {
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(2500);
+  http.useHTTP10(true);
+  if (!http.begin(c, url)) return false;
+  bool ok = false;
+  if (http.GET() == 200) {
+    WiFiClient *st = http.getStreamPtr();
+    unsigned long t0 = millis();
+    while (st->available() < 2 && millis() - t0 < 2000) delay(5);
+    if (st->available() >= 2) { int a = st->read(), b = st->read(); ok = (a == 0xFF && b == 0xD8); }
+  }
+  http.end();
+  return ok;
+}
+
+static bool camResolve() {
+  String hostOnly = printerHost;
+  int colon = hostOnly.indexOf(':');
+  if (colon >= 0) hostOnly = hostOnly.substring(0, colon);
+  String cands[8];
+  int n = 0;
+  String mine = camUrl;
+  if (mine.length()) cands[n++] = camAbs(mine, hostOnly);
+  {  // 問 Moonraker 有登記哪些鏡頭
+    WiFiClient c;
+    HTTPClient http;
+    http.setTimeout(2500);
+    if (http.begin(c, "http://" + printerHost + "/server/webcams/list") && http.GET() == 200) {
+      JsonDocument d;
+      if (!deserializeJson(d, http.getStream())) {
+        for (JsonObject w : d["result"]["webcams"].as<JsonArray>()) {
+          if (n >= 6) break;
+          if (!(w["enabled"] | true)) continue;
+          String sn = String((const char *)(w["snapshot_url"] | ""));
+          String st = String((const char *)(w["stream_url"] | ""));
+          if (sn.length()) cands[n++] = camAbs(sn, hostOnly);
+          else if (st.indexOf("action=stream") >= 0) { st.replace("action=stream", "action=snapshot"); cands[n++] = camAbs(st, hostOnly); }
+        }
+      }
+    }
+    http.end();
+  }
+  cands[n++] = "http://" + hostOnly + ":8080/?action=snapshot";   // Creality 常見的鏡頭位置
+  cands[n++] = "http://" + hostOnly + "/webcam/?action=snapshot";
+  for (int i = 0; i < n; i++) {
+    if (camProbe(cands[i])) { camResolved = cands[i]; Serial.printf("camera: %s\n", cands[i].c_str()); return true; }
+  }
+  return false;
+}
+
+static int camDraw(JPEGDRAW *p) {
+  uint16_t *dst = camBuf[camDecIdx];
+  int w = p->iWidthUsed ? p->iWidthUsed : p->iWidth;
+  if (p->x + w > camDecW) w = camDecW - p->x;
+  if (w <= 0) return 1;
+  for (int r = 0; r < p->iHeight; r++) {
+    int yy = p->y + r;
+    if (yy >= camDecH) break;
+    memcpy(dst + (size_t)yy * camDecW + p->x, p->pPixels + (size_t)r * p->iWidth, (size_t)w * 2);
+  }
+  return 1;
+}
+
+static bool camDecode(size_t len) {
+  if (!jpeg.openRAM(camJpg, (int)len, camDraw)) return false;
+  int w = jpeg.getWidth(), h = jpeg.getHeight();
+  int sc = 1, opt = 0;   // 縮小到寬度剛好 >= 300，越小解得越快
+  if (w / 8 >= 300) { sc = 8; opt = JPEG_SCALE_EIGHTH; }
+  else if (w / 4 >= 300) { sc = 4; opt = JPEG_SCALE_QUARTER; }
+  else if (w / 2 >= 300) { sc = 2; opt = JPEG_SCALE_HALF; }
+  camDecW = (w + sc - 1) / sc;
+  camDecH = (h + sc - 1) / sc;
+  size_t need = (size_t)(camDecW + 16) * (camDecH + 16);
+  if (need > camBufCap) {   // 解析度變大了：重新配置（先擋住主迴圈讀取）
+    xSemaphoreTake(camMux, portMAX_DELAY);
+    camReady = -1;
+    for (int i = 0; i < 2; i++) {
+      if (camBuf[i]) heap_caps_free(camBuf[i]);
+      camBuf[i] = (uint16_t *)heap_caps_malloc(need * 2, MALLOC_CAP_SPIRAM);
+    }
+    camBufCap = (camBuf[0] && camBuf[1]) ? need : 0;
+    xSemaphoreGive(camMux);
+    if (!camBufCap) { jpeg.close(); return false; }
+  }
+  camDecIdx = (camReady == 0) ? 1 : 0;   // 解到「沒在顯示」的那一塊
+  jpeg.setPixelType(RGB565_LITTLE_ENDIAN);
+  int ok = jpeg.decode(0, 0, opt);
+  jpeg.close();
+  if (!ok) return false;
+  xSemaphoreTake(camMux, portMAX_DELAY);
+  camW = camDecW;
+  camH = camDecH;
+  camReady = camDecIdx;
+  camSeq = camSeq + 1;
+  xSemaphoreGive(camMux);
+  return true;
+}
+
+static bool camFetchOne() {
+  if (camResolved.length() == 0) {
+    camSetStatus("Finding camera...");
+    if (!camResolve()) { camSetStatus("No camera found"); return false; }
+  }
+  if (!camJpg) {
+    camJpg = (uint8_t *)heap_caps_malloc(CAM_JPG_CAP, MALLOC_CAP_SPIRAM);
+    if (!camJpg) { camSetStatus("Out of memory"); return false; }
+  }
+  WiFiClient c;
+  HTTPClient http;
+  http.setTimeout(3000);
+  http.useHTTP10(true);
+  if (!http.begin(c, camResolved) || http.GET() != 200) {
+    http.end();
+    camResolved = "";
+    camSetStatus("Camera error");
+    return false;
+  }
+  int len = http.getSize();
+  WiFiClient *st = http.getStreamPtr();
+  size_t got = 0;
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3500 && got < CAM_JPG_CAP && (len < 0 || got < (size_t)len)) {
+    int av = st->available();
+    if (av > 0) {
+      size_t want = (size_t)av < CAM_JPG_CAP - got ? (size_t)av : CAM_JPG_CAP - got;
+      got += st->readBytes(camJpg + got, want);
+      t0 = millis();
+    } else if (!st->connected()) break;
+    else delay(2);
+  }
+  http.end();
+  if (got < 1000 || camJpg[0] != 0xFF || !camDecode(got)) { camSetStatus("Bad frame"); return false; }
+  camSetStatus("");
+  return true;
+}
+
+static void camTask(void *) {
+  String hostFor = "";
+  int revFor = 0;
+  for (;;) {
+    if (!camWanted || WiFi.status() != WL_CONNECTED || printerHost.length() == 0) { vTaskDelay(pdMS_TO_TICKS(150)); continue; }
+    if (hostFor != printerHost || revFor != camRev) { hostFor = printerHost; revFor = camRev; camResolved = ""; }
+    if (!camFetchOne()) vTaskDelay(pdMS_TO_TICKS(1000));
+    else vTaskDelay(pdMS_TO_TICKS(5));
+  }
+}
+
+// 把解好的鏡頭畫面（縮小版）放大成 466 寬（上下留黑邊），依旋轉設定轉向，整張推到螢幕
+static bool camPresent() {
+  if (!outBuf || camReady < 0) return false;
+  xSemaphoreTake(camMux, portMAX_DELAY);
+  const uint16_t *src = camBuf[camReady];
+  int sw = camW, sh = camH;
+  if (!src || sw <= 0 || sh <= 0) { xSemaphoreGive(camMux); return false; }
+  const int S = PANEL_W;
+  int bandH = (int)((long)S * sh / sw);
+  if (bandH > S) bandH = S;
+  int bandY = (S - bandH) / 2;
+  static uint16_t xm[PANEL_W], ym[PANEL_H];
+  for (int i = 0; i < S; i++) xm[i] = (uint16_t)((uint32_t)i * sw / S);
+  for (int i = 0; i < bandH; i++) ym[i] = (uint16_t)((uint32_t)i * sh / bandH);
+  uint16_t *o = outBuf;
+  for (int dy = 0; dy < S; dy++) {
+    for (int dx = 0; dx < S; dx++) {
+      int ux, uy;
+      switch (rotation & 3) {
+        case 1:  ux = dy;         uy = S - 1 - dx; break;
+        case 2:  ux = S - 1 - dx; uy = S - 1 - dy; break;
+        case 3:  ux = S - 1 - dy; uy = dx;         break;
+        default: ux = dx;         uy = dy;         break;
+      }
+      *o++ = (uy < bandY || uy >= bandY + bandH) ? 0 : src[ym[uy - bandY] * sw + xm[ux]];
+    }
+  }
+  xSemaphoreGive(camMux);
+  panelPush(0, 0, S, S, outBuf);
+  return true;
+}
+
+static char camMsgShown[28] = "\x01";
+static void drawCamMessage() {
+  tft.fillScreen(C_BG);
+  drawRingStatic();
+  text("CAMERA", UI_CX, 84, 4, C_WHITE, C_BG, TC_DATUM);
+  const char *m = printerHost.length() == 0 ? "Set printer IP first" : (camStatus[0] ? camStatus : "Connecting...");
+  text(m, UI_CX, 124, 2, C_GREY, C_BG, TC_DATUM);
+  drawPageDots(1);
+  strlcpy(camMsgShown, camStatus, sizeof camMsgShown);
+  markDirty();
+}
+
+// ---------------- 換頁與觸控事件 ----------------
+static bool pagesOk = false;   // WiFi 連上且網頁伺服器啟動後才允許換頁
+
+static void changePage(int np) {
+  np = constrain(np, 0, 2);
+  if (np == (int)uiPage) return;
+  bool wasCam = (uiPage == PG_CAM);
+  uiPage = (UiPage)np;
+  camWanted = (uiPage == PG_CAM);
+  if (wasCam) { camShowing = false; clearPanel(); }
+  kbOpen = false;
+  resetArm = 0;
+  uiFast = false;
+  screen = SCR_NONE;   // 回主畫面時由 loop 重畫
+  if (uiPage == PG_SET) { setScroll = 0; setDirty = true; }
+  if (uiPage == PG_CAM) { camSetStatus(""); camShownSeq = camSeq; drawCamMessage(); }
+  markDirty();
+}
+
+// 觸控的實體座標 → 畫布座標（反推 present() 的放大與旋轉）
+static void touchToLogical(int px, int py, int &lx, int &ly) {
+  const int S = UI_OUT, off = (PANEL_W - S) / 2;
+  int dx = constrain(px - off, 0, S - 1), dy = constrain(py - off, 0, S - 1), ix, iy;
+  switch (rotation & 3) {
+    case 1:  ix = dy;         iy = S - 1 - dx; break;
+    case 2:  ix = S - 1 - dx; iy = S - 1 - dy; break;
+    case 3:  ix = S - 1 - dy; iy = dx;         break;
+    default: ix = dx;         iy = dy;         break;
+  }
+  lx = ix * UI_W / S;
+  ly = iy * UI_W / S;
+}
+
+static bool tDown = false;
+static int tx0, ty0, tx, ty, tMode, tSlider, tScroll0;   // tMode: 0 未決定/點擊, 1 換頁滑動, 2 捲動, 3 拖滑塊
+
+static void handleTouchEvent(const TouchEvt &e) {
+  int lx, ly;
+  touchToLogical(e.x, e.y, lx, ly);
+  if (e.type == 0) {
+    tDown = true;
+    tx0 = tx = lx;
+    ty0 = ty = ly;
+    tMode = 0;
+    tScroll0 = setScroll;
+    tSlider = -1;
+    if (uiPage == PG_SET && !kbOpen) {
+      int r = sliderHit(lx, ly);
+      if (r >= 0) { tMode = 3; tSlider = r; uiFast = true; sliderDrag(r, lx); }
+    }
+  } else if (e.type == 1 && tDown) {
+    tx = lx;
+    ty = ly;
+    if (tMode == 3) {
+      sliderDrag(tSlider, lx);
+    } else if (tMode == 0 && !kbOpen) {
+      int dx = tx - tx0, dy = ty - ty0;
+      if (abs(dx) >= 16 && abs(dx) * 10 > abs(dy) * 13) tMode = 1;
+      else if (uiPage == PG_SET && abs(dy) >= 7 && abs(dy) > abs(dx)) { tMode = 2; uiFast = true; }
+    }
+    if (tMode == 2) { setScroll = constrain(tScroll0 - (ty - ty0), 0, stMaxScroll()); setDirty = true; }
+  } else if (e.type == 2 && tDown) {
+    tDown = false;
+    if (tMode == 1) {
+      int dx = tx - tx0;
+      if (pagesOk && abs(dx) >= 34) changePage((int)uiPage + (dx < 0 ? 1 : -1));   // 手指往左滑 = 下一頁
+    } else if (tMode == 3) {
+      saveConfig();
+      uiFast = false;
+      setDirty = true;
+    } else if (tMode == 2) {
+      uiFast = false;
+      setDirty = true;
+    } else if (uiPage == PG_SET) {
+      if (kbOpen) kbTap(tx0, ty0);
+      else settingsTap(tx0, ty0);
+    }
+    tMode = 0;
+  }
+}
+
+// 每圈呼叫：處理觸控、重畫設定頁、推送鏡頭畫面
+static void pagesLoop() {
+  TouchEvt e;
+  for (int n = 0; n < 24 && panelTouchGet(e); n++) handleTouchEvent(e);
+  if (uiPage == PG_SET) {
+    if (resetArm && millis() > resetArm) { resetArm = 0; setDirty = true; }
+    if (kbOpen && kbErrUntil && millis() > kbErrUntil) { kbErrUntil = 0; kbErr = ""; setDirty = true; }
+    if (setDirty) renderSettings();
+  } else if (uiPage == PG_CAM) {
+    if (camSeq != camShownSeq) {
+      camShownSeq = camSeq;
+      if (camPresent()) { camShowing = true; camLastFrame = millis(); }
+    } else if (camShowing && millis() - camLastFrame > 5000) {
+      camShowing = false;
+      clearPanel();
+      drawCamMessage();
+    } else if (!camShowing && strcmp(camMsgShown, camStatus) != 0) {
+      drawCamMessage();
+    }
+  }
 }
 
 // ====================== 設定網頁 ======================
@@ -1189,6 +1841,10 @@ td{padding:3px 12px 3px 0;font-size:14px}td:first-child{color:#9aa}
 <div class="c"><form method="POST" action="/save">
 <label for="host">印表機位址（IP 或 IP:埠，預設埠 7125）</label>
 <input id="host" name="host" placeholder="192.168.0.102:7125" value=")HTML";
+
+static const char PAGE_MID_A[] PROGMEM = R"HTML(">
+<label for="cam" style="margin-top:12px">監視鏡頭快照網址（選填，留空自動偵測）</label>
+<input id="cam" name="cam" placeholder="http://192.168.0.102:8080/?action=snapshot" value=")HTML";
 
 static const char PAGE_MID[] PROGMEM = R"HTML(">
 <button type="submit">儲存</button><button type="button" class="g" onclick="t()">測試連線</button>
@@ -1226,6 +1882,9 @@ void handleRoot() {
   // 注意：chunked 模式下 sendContent("") 會直接結束回應，所以空字串不能送
   String hostVal = htmlEscape(printerHost);
   if (hostVal.length() > 0) web.sendContent(hostVal);
+  web.sendContent_P(PAGE_MID_A);
+  String camVal = htmlEscape(camUrl);
+  if (camVal.length() > 0) web.sendContent(camVal);
   web.sendContent_P(PAGE_MID);
   String ago = lastOkMs ? String((millis() - lastOkMs) / 1000) + " 秒前" : String("尚未成功");
   web.sendContent(row("WiFi", WiFi.SSID()));
@@ -1256,6 +1915,11 @@ void handleSave() {
     return;
   }
   printerHost = host;
+  if (web.hasArg("cam")) {
+    String cu = web.arg("cam");
+    cu.trim();
+    if (cu != camUrl) { camUrl = cu; camRev = camRev + 1; }
+  }
   saveConfig();
   failCount = 0;
   nextPoll = 0;  // 立刻重新輪詢
@@ -1292,20 +1956,6 @@ void handleTest() {
   String body;
   serializeJson(out, body);
   web.send(200, "application/json; charset=utf-8", body);
-}
-
-// 旋轉畫面：輸出時轉向（見 present），再整個畫面重畫
-void applyRotation(int r) {
-  rotation = constrain(r, 0, 3);   // 旋轉在 present() 輸出時處理，畫布本身不轉
-  tft.fillScreen(C_BG);
-  markDirty();
-  Screen s = screen;
-  screen = SCR_NONE;  // 強迫 setScreen 重畫目前的畫面（配網 / 設定提示 / 主畫面）
-  setScreen(s);
-  if (s == SCR_DASH) {
-    shownValid = false;
-    renderDash();
-  }
 }
 
 // 滑塊即時套用（不寫入）；放開滑塊時網頁會帶 save=1 才寫入快閃記憶體
@@ -1370,6 +2020,9 @@ void setup() {
 
   if (!panelBegin()) Serial.println("AMOLED init failed");
   setBacklight(brightPct);
+  if (!panelTouchBegin()) Serial.println("touch init failed");
+  camMux = xSemaphoreCreateMutex();
+  xTaskCreatePinnedToCore(camTask, "cam", 12288, nullptr, 1, nullptr, 0);   // 鏡頭工作放在 core 0，不影響畫面與觸控
 
   tft.setColorDepth(16);
   bool canvasOk = tft.createSprite(UI_W, UI_W) != nullptr;
@@ -1380,6 +2033,9 @@ void setup() {
   tft.fillScreen(C_BG);
   setScreen(SCR_BOOT);
   present();
+  delay(150);
+  setBacklight(brightPct);   // 第一張畫面推出去之後再寫一次亮度，確保面板吃到
+  Serial.printf("brightness %d%% -> %d\n", brightPct, brightPct * 255 / 100);
 
   // 非阻塞配網：沒存過 WiFi 或連不上時，開熱點讓手機設定
   wm.setConfigPortalBlocking(false);
@@ -1399,15 +2055,22 @@ void loop() {
   // 配網入口和自己的網頁伺服器都用 80 埠：等 WiFi 連上、入口結束後才啟動
   if (!webStarted && wifiUp && !wm.getConfigPortalActive()) startWeb();
 
-  if (wifiUp && webStarted) {
-    if (printerHost.length() == 0) {
-      setScreen(SCR_NOHOST);
-    } else {
-      if (screen != SCR_DASH) { setScreen(SCR_DASH); }
-      if (millis() >= nextPoll) {
-        nextPoll = millis() + (unsigned long)pollSec * 1000UL;
-        doPoll();
+  pagesOk = wifiUp && webStarted;
+  if (!pagesOk && uiPage != PG_DASH) changePage(PG_DASH);
+  pagesLoop();
+
+  if (pagesOk) {
+    if (uiPage == PG_DASH) {
+      if (printerHost.length() == 0) {
+        setScreen(SCR_NOHOST);
+      } else if (screen != SCR_DASH) {
+        setScreen(SCR_DASH);
+        renderDash();   // 從別的頁面滑回來時，立刻把主畫面整張畫好
       }
+    }
+    if (printerHost.length() > 0 && millis() >= nextPoll) {
+      nextPoll = millis() + (unsigned long)pollSec * 1000UL;
+      doPoll();
     }
   } else if (wm.getConfigPortalActive()) {
     setScreen(SCR_PORTAL);
