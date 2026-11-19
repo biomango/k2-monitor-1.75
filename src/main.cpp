@@ -1,22 +1,26 @@
 /*
- * Creality K2 Plus 列印監控 — ESP8266 + ST7789 240x240
+ * Creality K2 Plus 列印監控 — Waveshare ESP32-S3-Touch-AMOLED-1.75（466x466 圓形 AMOLED）
  *
  * 流程：
  *  1. 第一次開機（或換了 WiFi）→ 螢幕顯示熱點名稱，手機連上後設定 WiFi（WiFiManager）
  *  2. WiFi 連上 → 啟動設定網頁（螢幕顯示裝置 IP），在網頁填「印表機位址」
  *  3. 之後每 3 秒向 Moonraker 要一次資料並更新畫面
  *
- * 未實機編譯測試，請先照 platformio.ini 的註解核對腳位。
+ * 畫面架構：UI 維持原本 240x240 的版面，畫在 TFT_eSPI 的離屏畫布（只當畫布和字型用，不碰硬體），
+ * 再放大（雙線性）、依旋轉設定轉向，置中推到 AMOLED（src/panel.cpp）。
+ *
+ * 未實機編譯測試。
  */
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <ESP8266WebServer.h>
-#include <ESP8266HTTPClient.h>
-#include <ESP8266mDNS.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <HTTPClient.h>
+#include <ESPmDNS.h>
 #include <WiFiManager.h>
 #include <LittleFS.h>
 #include <ArduinoJson.h>
 #include <TFT_eSPI.h>
+#include "panel.h"
 
 // 精簡 PNG 縮圖解碼器：給 ESP8266 這類記憶體很小的裝置用。
 // 重點：deflate 的「回溯視窗」(最多 32KB) 不放在 RAM，而是用 2KB 環形緩衝 + 檔案系統暫存檔，
@@ -252,9 +256,8 @@ class ThumbDecoder {
 #define DEFAULT_PORT       7125
 #define POLL_DEFAULT_SEC   3                // 資料更新週期預設值（秒），網頁可改 1~30
 #define HTTP_TIMEOUT_MS    4000
-#define BL_PIN             5                // 背光腳位
-#define BL_ON_LEVEL        LOW              // 螢幕全黑的話改成 HIGH
-#define BL_PWM_RANGE       1023             // 背光 PWM 解析度（setup 會明確設定，不依賴核心預設值）
+#define UI_OUT             352              // 畫面放大後的邊長（像素）。352 ≈ 1.47 倍，外圈進度條剛好落在圓形螢幕內；240 = 不放大
+#define UI_FPS_MS          30               // 推送畫面的最短間隔（毫秒）
 #define FLOW_EFFECT        1                // 外圈流水特效，0 = 關閉
 #define FLOW_MS            40               // 流水每幀間隔（毫秒），越小越流暢但越吃 CPU
 #define FLOW_STEP          5.0f             // 每幀前進的像素
@@ -277,13 +280,14 @@ class ThumbDecoder {
 #define C_CARDSOLID RGB565(46, 51, 92)   // 沒有 sprite 時的備援：卡片實心色
 #define CARD_A5  10                      // 卡片不透明度 0~32（10 ≈ 30%）
 
-TFT_eSPI tft;
-TFT_eSprite spr = TFT_eSprite(&tft);  // 離屏畫布：每次畫一條 184x25 的橫帶，畫好再一次推上螢幕，避免「先清掉再重畫」造成的閃爍
+TFT_eSPI hw;                          // 只當 sprite 的父物件，不會 init，不碰任何腳位
+TFT_eSprite tft = TFT_eSprite(&hw);   // 240x240 全畫面畫布（原本直接畫在螢幕上的東西現在都畫在這裡）
+TFT_eSprite spr = TFT_eSprite(&hw);   // 離屏畫布：每次畫一條 184x25 的橫帶，畫好再貼到全畫面畫布
 bool sprOk = false;
 bool useSpr = false;                  // 目前繪圖目標：true = sprite，false = 螢幕本身
 int ox = 0, oy = 0;                   // 繪圖目標左上角對應的螢幕座標
 int curStripY = 0;                    // 目前正在組合的橫帶起始 y（螢幕座標）
-ESP8266WebServer web(80);
+WebServer web(80);
 WiFiManager wm;
 
 String printerHost;            // 例如 "192.168.0.102:7125"
@@ -291,6 +295,9 @@ int brightPct = 100;           // 螢幕背光亮度 5~100 (%)
 int bgLevel = 70;              // 背景數字亮度 0~255
 int pollSec = POLL_DEFAULT_SEC;  // 資料更新週期 1~30 秒
 int rotation = 0;              // 畫面旋轉 0~3（每格 90°）
+
+static bool uiDirty = true;    // 畫布有變動，等著推到螢幕
+static inline void markDirty() { uiDirty = true; }
 
 // ---- 列印檔縮圖 ----
 #define THUMB_W    84
@@ -367,11 +374,10 @@ void saveConfig() {
   f.close();
 }
 
-// 背光用 PWM 調亮度；BL_ON_LEVEL 為 LOW 的板子是「低電位亮」，所以佔空比要反過來
+// AMOLED 沒有背光腳位，亮度直接寫進 CO5300 的亮度暫存器（0~255）
 void setBacklight(int pct) {
   brightPct = constrain(pct, 5, 100);
-  int v = brightPct * BL_PWM_RANGE / 100;
-  analogWrite(BL_PIN, BL_ON_LEVEL == LOW ? BL_PWM_RANGE - v : v);
+  panelBrightness((uint8_t)(brightPct * 255 / 100));
 }
 
 // 接受 "192.168.0.102"、"192.168.0.102:7125"、"http://192.168.0.102:7125/"，統一成 "ip:port"
@@ -452,6 +458,7 @@ static void ringPoint(float s, int &x, int &y) {
 
 static void drawRing(float from, float to, uint16_t col) {
   if (to <= from) return;
+  markDirty();
   int x, y;
   for (float s = from; s <= to; s += 2.0f) {
     ringPoint(s, x, y);
@@ -522,6 +529,61 @@ static inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
   uint32_t b = (bg | ((uint32_t)bg << 16)) & 0x07E0F81Fu;
   uint32_t r = ((((f - b) * a) >> 5) + b) & 0x07E0F81Fu;
   return (uint16_t)(r | (r >> 16));
+}
+
+// ====================== 輸出到 AMOLED ======================
+// 240x240 畫布 → 雙線性放大成 UI_OUT x UI_OUT → 依 rotation 轉向 → 置中推到 466x466 面板
+// （圓形面板的四個角本來就看不到，所以外圈進度條的轉角要落在圓內：UI_OUT 不要超過約 355）
+struct AxisMap { uint16_t i0, i1; uint8_t w; };   // w：給 i1 的權重 0~32
+static AxisMap axisMap[UI_OUT];
+static uint16_t *outBuf = nullptr;
+
+static bool presentInit() {
+  for (int d = 0; d < UI_OUT; d++) {
+    float f = (d + 0.5f) * 240.0f / UI_OUT - 0.5f;
+    if (f < 0) f = 0;
+    if (f > 239) f = 239;
+    int i0 = (int)f, i1 = i0 < 239 ? i0 + 1 : i0;
+    axisMap[d] = { (uint16_t)i0, (uint16_t)i1, (uint8_t)((f - i0) * 32.0f + 0.5f) };
+  }
+  outBuf = (uint16_t *)heap_caps_malloc((size_t)UI_OUT * UI_OUT * 2, MALLOC_CAP_SPIRAM);
+  if (!outBuf) outBuf = (uint16_t *)malloc((size_t)UI_OUT * UI_OUT * 2);
+  return outBuf != nullptr;
+}
+
+static void present() {
+  uiDirty = false;
+  if (!outBuf) return;
+  const uint16_t *src = (const uint16_t *)tft.getPointer();   // TFT_eSprite 的 16 位元像素是高低位元組對調存放的
+  if (!src) return;
+  const int S = UI_OUT;
+  uint16_t *o = outBuf;
+  for (int dy = 0; dy < S; dy++) {
+    for (int dx = 0; dx < S; dx++) {
+      int ix, iy;
+      switch (rotation & 3) {
+        case 1:  ix = dy;         iy = S - 1 - dx; break;
+        case 2:  ix = S - 1 - dx; iy = S - 1 - dy; break;
+        case 3:  ix = S - 1 - dy; iy = dx;         break;
+        default: ix = dx;         iy = dy;         break;
+      }
+      const AxisMap &mx = axisMap[ix], &my = axisMap[iy];
+      const uint16_t *r0 = src + my.i0 * 240, *r1 = src + my.i1 * 240;
+      uint16_t a = __builtin_bswap16(r0[mx.i0]), b = __builtin_bswap16(r0[mx.i1]);
+      uint16_t c = __builtin_bswap16(r1[mx.i0]), d = __builtin_bswap16(r1[mx.i1]);
+      *o++ = blend565(blend565(d, c, mx.w), blend565(b, a, mx.w), my.w);   // 先水平內插，再垂直內插
+    }
+  }
+  panelPush((PANEL_W - S) / 2, (PANEL_H - S) / 2, S, S, outBuf);
+}
+
+static void presentIfDirty() {
+  static unsigned long last = 0;
+  if (!uiDirty) return;
+  unsigned long now = millis();
+  if (now - last < UI_FPS_MS) return;
+  last = now;
+  present();
 }
 
 // 透明背景文字（只畫字，不填底色）：疊在背景大數字上用
@@ -650,6 +712,7 @@ static void drawWifiLost() {
 static void setScreen(Screen s) {
   if (s == screen) return;
   screen = s;
+  markDirty();
   shownValid = false;
   switch (s) {
     case SCR_BOOT:     drawBoot(); break;
@@ -773,7 +836,8 @@ static void composeStrip(int y0) {
     spr.fillSprite(C_BG);
     drawBgNumber();
     drawForeground();
-    spr.pushSprite(STRIP_X, y0);
+    spr.pushToSprite(&tft, STRIP_X, y0);
+    markDirty();
   } else {  // 記憶體不夠建 sprite 時的備援：直接畫在螢幕上，用 viewport 限制只畫這一條
     useSpr = false;
     ox = 0;
@@ -783,6 +847,7 @@ static void composeStrip(int y0) {
     drawBgNumber();
     drawForeground();
     tft.resetViewport();
+    markDirty();
   }
 }
 
@@ -879,6 +944,7 @@ static void animateFlow() {
     tft.fillCircle(x, y, 8, tint(cur.stateColor, (uint8_t)(40 + 190 * t)));
   }
   flowHead = newHead;
+  markDirty();
 }
 #endif
 
@@ -955,7 +1021,7 @@ static void fetchThumb(const String &fn) {
   closeThumbFile();
   thumbVer++;
   if (printerHost.length() == 0) return;
-  if (ESP.getMaxFreeBlockSize() < 11000) { Serial.println("thumb: not enough RAM, skipped"); return; }
+  if (ESP.getMaxAllocHeap() < 30000) { Serial.println("thumb: not enough RAM, skipped"); return; }
 
   WiFiClient client;
   HTTPClient http;
@@ -1018,7 +1084,7 @@ static void fetchThumb(const String &fn) {
   else LittleFS.remove("/thumb.new");
   thumbOk = ok;
   thumbVer++;
-  Serial.printf("thumb: %s (%d bytes png), free heap %u\n", ok ? "ok" : "decode failed", pngLen, ESP.getFreeHeap());
+  Serial.printf("thumb: %s (%d bytes png), free heap %u\n", ok ? "ok" : "decode failed", pngLen, (unsigned)ESP.getFreeHeap());
 }
 
 // ---- 剩餘時間估算 ----
@@ -1309,11 +1375,11 @@ void handleTest() {
   web.send(200, "application/json; charset=utf-8", body);
 }
 
-// 旋轉畫面：設定 TFT 的方向（240x240 的位址偏移由 TFT_eSPI 自動處理），再整個畫面重畫
+// 旋轉畫面：輸出時轉向（見 present），再整個畫面重畫
 void applyRotation(int r) {
-  rotation = constrain(r, 0, 3);
-  tft.setRotation(rotation);
+  rotation = constrain(r, 0, 3);   // 旋轉在 present() 輸出時處理，畫布本身不轉
   tft.fillScreen(C_BG);
+  markDirty();
   Screen s = screen;
   screen = SCR_NONE;  // 強迫 setScreen 重畫目前的畫面（配網 / 設定提示 / 主畫面）
   setScreen(s);
@@ -1379,19 +1445,23 @@ void startWeb() {
 // ====================== setup / loop ======================
 void setup() {
   Serial.begin(115200);
-  pinMode(BL_PIN, OUTPUT);
-  analogWriteRange(BL_PWM_RANGE);  // ESP8266 核心 3.x 預設範圍是 255，這裡明確設成 1023
 
-  LittleFS.begin();
+  LittleFS.begin(true);   // 第一次開機分割區沒格式化時自動格式化
   loadConfig();
+
+  if (!panelBegin()) Serial.println("AMOLED init failed");
   setBacklight(brightPct);
 
-  tft.init();
-  tft.setRotation(rotation);
-  sprOk = spr.createSprite(STRIP_W, STRIP_H) != nullptr;   // 最早配置，避免之後記憶體碎片化配不到
-  Serial.printf("sprite %s, free heap %u\n", sprOk ? "ok" : "FAILED", ESP.getFreeHeap());
+  tft.setColorDepth(16);
+  bool canvasOk = tft.createSprite(240, 240) != nullptr;
+  sprOk = spr.createSprite(STRIP_W, STRIP_H) != nullptr;
+  bool outOk = presentInit();
+  Serial.printf("canvas %s, strip %s, out %s, free heap %u, free psram %u\n",
+                canvasOk ? "ok" : "FAILED", sprOk ? "ok" : "FAILED", outOk ? "ok" : "FAILED",
+                (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   tft.fillScreen(C_BG);
   setScreen(SCR_BOOT);
+  present();
 
   // 非阻塞配網：沒存過 WiFi 或連不上時，開熱點讓手機設定
   wm.setConfigPortalBlocking(false);
@@ -1404,7 +1474,6 @@ void loop() {
   wm.process();
   if (webStarted) {
     web.handleClient();
-    MDNS.update();
   }
 
   bool wifiUp = WiFi.status() == WL_CONNECTED;
@@ -1430,5 +1499,6 @@ void loop() {
 #if FLOW_EFFECT
   if (screen == SCR_DASH) animateFlow();
 #endif
+  presentIfDirty();
   yield();
 }
