@@ -256,7 +256,9 @@ class ThumbDecoder {
 #define DEFAULT_PORT       7125
 #define POLL_DEFAULT_SEC   3                // 資料更新週期預設值（秒），網頁可改 1~30
 #define HTTP_TIMEOUT_MS    4000
-#define UI_OUT             352              // 畫面放大後的邊長（像素）。352 ≈ 1.47 倍，外圈進度條剛好落在圓形螢幕內；240 = 不放大
+#define UI_W               232              // 內部畫布邊長（邏輯像素）。圓形介面以 (116,116) 為圓心、半徑 116
+#define UI_OUT             464              // 輸出邊長 = 畫布 x 2（整數倍），剛好填滿 466 的圓形面板
+#define UI_SMOOTH          1                // 1 = 雙線性放大（字比較柔）；0 = 最近鄰（字有顆粒感但最銳利，也比較快）
 #define UI_FPS_MS          30               // 推送畫面的最短間隔（毫秒）
 #define FLOW_EFFECT        1                // 外圈流水特效，0 = 關閉
 #define FLOW_MS            40               // 流水每幀間隔（毫秒），越小越流暢但越吃 CPU
@@ -281,12 +283,7 @@ class ThumbDecoder {
 #define CARD_A5  10                      // 卡片不透明度 0~32（10 ≈ 30%）
 
 TFT_eSPI hw;                          // 只當 sprite 的父物件，不會 init，不碰任何腳位
-TFT_eSprite tft = TFT_eSprite(&hw);   // 240x240 全畫面畫布（原本直接畫在螢幕上的東西現在都畫在這裡）
-TFT_eSprite spr = TFT_eSprite(&hw);   // 離屏畫布：每次畫一條 184x25 的橫帶，畫好再貼到全畫面畫布
-bool sprOk = false;
-bool useSpr = false;                  // 目前繪圖目標：true = sprite，false = 螢幕本身
-int ox = 0, oy = 0;                   // 繪圖目標左上角對應的螢幕座標
-int curStripY = 0;                    // 目前正在組合的橫帶起始 y（螢幕座標）
+TFT_eSprite tft = TFT_eSprite(&hw);   // 232x232 全畫面畫布：所有東西都畫在這裡，再整張放大推到 AMOLED
 WebServer web(80);
 WiFiManager wm;
 
@@ -300,8 +297,8 @@ static bool uiDirty = true;    // 畫布有變動，等著推到螢幕
 static inline void markDirty() { uiDirty = true; }
 
 // ---- 列印檔縮圖 ----
-#define THUMB_W    84
-#define THUMB_H    84
+#define THUMB_W    72
+#define THUMB_H    72
 #define THUMB_FILE "/thumb.bin"
 String thumbName = "";         // 最近一次處理過（成功或失敗）的檔名，同一個檔案只抓一次
 bool thumbOk = false;
@@ -413,47 +410,19 @@ bool normalizeHost(String in, String &out, String &err) {
 }
 
 // ====================== 外圈進度條 ======================
-// 路徑：上緣中間出發、順時針、轉角半徑 18、筆寬 16，貼著 240x240 邊緣
-static const float RING_R = 18.0f;
-static const float RING_ARC = RING_R * 1.5707963f;
-static const float RING_TOTAL = 92.0f * 2 + 184.0f * 3 + RING_ARC * 4;
+// 圓形螢幕：進度條是一整圈圓環，從 12 點鐘方向出發、順時針；圓心 (116,116)、半徑 108、筆寬 12
+#define UI_CX    116
+#define UI_CY    116
+#define RING_R   108.0f
+#define RING_PEN 6                       // 筆的半徑（像素）；環佔 102~114，距畫布邊緣留 2
+static const float RING_TOTAL = RING_R * 6.2831853f;
 
 static void ringPoint(float s, int &x, int &y) {
   if (s < 0) s = 0;
   if (s > RING_TOTAL) s = RING_TOTAL;
-  float fx, fy;
-  if (s < 92) { fx = 120 + s; fy = 10; }
-  else {
-    s -= 92;
-    if (s < RING_ARC) { float a = -1.5707963f + s / RING_R; fx = 212 + RING_R * cosf(a); fy = 28 + RING_R * sinf(a); }
-    else {
-      s -= RING_ARC;
-      if (s < 184) { fx = 230; fy = 28 + s; }
-      else {
-        s -= 184;
-        if (s < RING_ARC) { float a = s / RING_R; fx = 212 + RING_R * cosf(a); fy = 212 + RING_R * sinf(a); }
-        else {
-          s -= RING_ARC;
-          if (s < 184) { fx = 212 - s; fy = 230; }
-          else {
-            s -= 184;
-            if (s < RING_ARC) { float a = 1.5707963f + s / RING_R; fx = 28 + RING_R * cosf(a); fy = 212 + RING_R * sinf(a); }
-            else {
-              s -= RING_ARC;
-              if (s < 184) { fx = 10; fy = 212 - s; }
-              else {
-                s -= 184;
-                if (s < RING_ARC) { float a = 3.1415927f + s / RING_R; fx = 28 + RING_R * cosf(a); fy = 28 + RING_R * sinf(a); }
-                else { s -= RING_ARC; fx = 28 + s; fy = 10; }
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-  x = (int)(fx + 0.5f);
-  y = (int)(fy + 0.5f);
+  float a = -1.5707963f + s / RING_R;
+  x = (int)(UI_CX + RING_R * cosf(a) + 0.5f);
+  y = (int)(UI_CY + RING_R * sinf(a) + 0.5f);
 }
 
 static void drawRing(float from, float to, uint16_t col) {
@@ -462,10 +431,10 @@ static void drawRing(float from, float to, uint16_t col) {
   int x, y;
   for (float s = from; s <= to; s += 2.0f) {
     ringPoint(s, x, y);
-    tft.fillCircle(x, y, 8, col);
+    tft.fillCircle(x, y, RING_PEN, col);
   }
   ringPoint(to, x, y);
-  tft.fillCircle(x, y, 8, col);
+  tft.fillCircle(x, y, RING_PEN, col);
 }
 
 // ====================== 繪圖輔助 ======================
@@ -502,26 +471,15 @@ static uint16_t textOn(uint32_t rgb) {
   return (r * 299 + g * 587 + b * 114) / 1000 > 150 ? RGB565(0, 0, 0) : C_WHITE;
 }
 
-// ---- 離屏繪圖包裝：呼叫時一律用「螢幕座標」，自動換算成目前繪圖目標（sprite 或螢幕）的座標 ----
-#define STRIP_X  28
-#define STRIP_W  184
-#define STRIP_H  25
-#define STRIP_Y0 22
-#define STRIP_N  8   // 8 條 x 25 列 = y 22~221
-
-// 直接對 sprite 或 tft 這個物件呼叫（不經過基底類別指標），確保用到的是各自的實作
-#define GO(call) do { if (useSpr) spr.call; else tft.call; } while (0)
-
-static inline void gRect(int x, int y, int w, int h, uint16_t c) { GO(fillRect(x - ox, y - oy, w, h, c)); }
-static inline void gTri(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) {
-  GO(fillTriangle(x0 - ox, y0 - oy, x1 - ox, y1 - oy, x2 - ox, y2 - oy, c));
-}
-static inline void gCircle(int x, int y, int r, uint16_t c) { GO(fillCircle(x - ox, y - oy, r, c)); }
-static inline void gCircleO(int x, int y, int r, uint16_t c) { GO(drawCircle(x - ox, y - oy, r, c)); }
-static inline void gRRect(int x, int y, int w, int h, int r, uint16_t c) { GO(fillRoundRect(x - ox, y - oy, w, h, r, c)); }
-static inline void gRRectO(int x, int y, int w, int h, int r, uint16_t c) { GO(drawRoundRect(x - ox, y - oy, w, h, r, c)); }
-static inline void gLine(int x0, int y0, int x1, int y1, uint16_t c) { GO(drawLine(x0 - ox, y0 - oy, x1 - ox, y1 - oy, c)); }
-static inline void gPixel(int x, int y, uint16_t c) { GO(drawPixel(x - ox, y - oy, c)); }
+// ---- 繪圖包裝：全部畫在 232x232 全畫面畫布（tft）上 ----
+static inline void gRect(int x, int y, int w, int h, uint16_t c) { tft.fillRect(x, y, w, h, c); }
+static inline void gTri(int x0, int y0, int x1, int y1, int x2, int y2, uint16_t c) { tft.fillTriangle(x0, y0, x1, y1, x2, y2, c); }
+static inline void gCircle(int x, int y, int r, uint16_t c) { tft.fillCircle(x, y, r, c); }
+static inline void gCircleO(int x, int y, int r, uint16_t c) { tft.drawCircle(x, y, r, c); }
+static inline void gRRect(int x, int y, int w, int h, int r, uint16_t c) { tft.fillRoundRect(x, y, w, h, r, c); }
+static inline void gRRectO(int x, int y, int w, int h, int r, uint16_t c) { tft.drawRoundRect(x, y, w, h, r, c); }
+static inline void gLine(int x0, int y0, int x1, int y1, uint16_t c) { tft.drawLine(x0, y0, x1, y1, c); }
+static inline void gPixel(int x, int y, uint16_t c) { tft.drawPixel(x, y, c); }
 
 // 565 快速混色：a = 0~32（0 全是 bg，32 全是 fg）
 static inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
@@ -532,19 +490,23 @@ static inline uint16_t blend565(uint16_t fg, uint16_t bg, uint8_t a) {
 }
 
 // ====================== 輸出到 AMOLED ======================
-// 240x240 畫布 → 雙線性放大成 UI_OUT x UI_OUT → 依 rotation 轉向 → 置中推到 466x466 面板
-// （圓形面板的四個角本來就看不到，所以外圈進度條的轉角要落在圓內：UI_OUT 不要超過約 355）
+// 232x232 畫布 → 放大成 UI_OUT x UI_OUT（2 倍）→ 依 rotation 轉向 → 置中推到 466x466 面板
 struct AxisMap { uint16_t i0, i1; uint8_t w; };   // w：給 i1 的權重 0~32
 static AxisMap axisMap[UI_OUT];
 static uint16_t *outBuf = nullptr;
 
 static bool presentInit() {
   for (int d = 0; d < UI_OUT; d++) {
-    float f = (d + 0.5f) * 240.0f / UI_OUT - 0.5f;
+#if UI_SMOOTH
+    float f = (d + 0.5f) * UI_W / UI_OUT - 0.5f;
     if (f < 0) f = 0;
-    if (f > 239) f = 239;
-    int i0 = (int)f, i1 = i0 < 239 ? i0 + 1 : i0;
+    if (f > UI_W - 1) f = UI_W - 1;
+    int i0 = (int)f, i1 = i0 < UI_W - 1 ? i0 + 1 : i0;
     axisMap[d] = { (uint16_t)i0, (uint16_t)i1, (uint8_t)((f - i0) * 32.0f + 0.5f) };
+#else
+    int i0 = (int)((long)d * UI_W / UI_OUT);
+    axisMap[d] = { (uint16_t)i0, (uint16_t)i0, 0 };
+#endif
   }
   outBuf = (uint16_t *)heap_caps_malloc((size_t)UI_OUT * UI_OUT * 2, MALLOC_CAP_SPIRAM);
   if (!outBuf) outBuf = (uint16_t *)malloc((size_t)UI_OUT * UI_OUT * 2);
@@ -568,7 +530,7 @@ static void present() {
         default: ix = dx;         iy = dy;         break;
       }
       const AxisMap &mx = axisMap[ix], &my = axisMap[iy];
-      const uint16_t *r0 = src + my.i0 * 240, *r1 = src + my.i1 * 240;
+      const uint16_t *r0 = src + my.i0 * UI_W, *r1 = src + my.i1 * UI_W;
       uint16_t a = __builtin_bswap16(r0[mx.i0]), b = __builtin_bswap16(r0[mx.i1]);
       uint16_t c = __builtin_bswap16(r1[mx.i0]), d = __builtin_bswap16(r1[mx.i1]);
       *o++ = blend565(blend565(d, c, mx.w), blend565(b, a, mx.w), my.w);   // 先水平內插，再垂直內插
@@ -588,24 +550,19 @@ static void presentIfDirty() {
 
 // 透明背景文字（只畫字，不填底色）：疊在背景大數字上用
 static void gText(const String &s, int x, int y, int font, uint16_t fg, uint8_t datum = TL_DATUM) {
-  GO(setTextDatum(datum));
-  GO(setTextColor(fg));
-  GO(drawString(s, x - ox, y - oy, font));
+  tft.setTextDatum(datum);
+  tft.setTextColor(fg);
+  tft.drawString(s, x, y, font);
 }
 
-// 半透明圓角卡片：把底下已經畫好的內容（含背景大數字）混入淡紫色。只處理目前這條橫帶範圍內的列
+// 半透明圓角卡片：把底下已經畫好的內容（含背景大數字）混入淡紫色
 static void gCard(int x, int y, int w, int h, int r) {
-  if (!useSpr) { gRRect(x, y, w, h, r, C_CARDSOLID); return; }   // 備援：實心卡片
-  int ys = y > curStripY ? y : curStripY;
-  int ye = (y + h < curStripY + STRIP_H) ? y + h : curStripY + STRIP_H;
-  for (int py = ys; py < ye; py++) {
+  for (int py = y; py < y + h; py++) {
     int dy = py - y; if (y + h - 1 - py < dy) dy = y + h - 1 - py;   // 離上緣或下緣幾列
     int inset = 0;
     if (dy < r) { float t = r - dy - 0.5f; inset = r - (int)(sqrtf((float)(r * r) - t * t) + 0.5f); }
-    for (int px = x + inset; px < x + w - inset; px++) {
-      uint16_t b = spr.readPixel(px - ox, py - oy);
-      spr.drawPixel(px - ox, py - oy, blend565(C_CARD, b, CARD_A5));
-    }
+    for (int px = x + inset; px < x + w - inset; px++)
+      tft.drawPixel(px, py, blend565(C_CARD, tft.readPixel(px, py), CARD_A5));
   }
 }
 
@@ -668,45 +625,47 @@ static void drawSeg7Digit(int d, int x, int y, int w, int h, int t, uint16_t col
 static void drawBgNumber() {
   if (bgNum < 0) return;
   uint16_t col = mix565(C_BG, C_WHITE, bgLevel);
-  // 條帶寬 184（x 28~212）：兩個數字各 88 寬、間隔 8，剛好塞滿；高 196（y 22~218）
-  drawSeg7Digit(bgNum / 10, 28, 22, 88, 196, 25, col);
-  drawSeg7Digit(bgNum % 10, 124, 22, 88, 196, 25, col);
+  // 兩個數字各 60 x 130、間隔 8，置中；四個角離圓心約 91，在內圈（半徑 102）之內
+  drawSeg7Digit(bgNum / 10, 52, 51, 60, 130, 17, col);
+  drawSeg7Digit(bgNum % 10, 120, 51, 60, 130, 17, col);
 }
 
 // ====================== 各畫面 ======================
 enum Screen { SCR_NONE, SCR_BOOT, SCR_PORTAL, SCR_NOHOST, SCR_WIFILOST, SCR_DASH };
 Screen screen = SCR_NONE;
 
+// 圓形螢幕：所有文字都置中，每一行的寬度要放得進該高度的圓弦（越靠近上下越窄）
 static void drawBoot() {
   tft.fillScreen(C_BG);
-  text("K2 Monitor", 120, 80, 4, C_WHITE, C_BG, TC_DATUM);
-  text("Connecting WiFi...", 120, 130, 2, C_GREY, C_BG, TC_DATUM);
+  text("K2 Monitor", UI_CX, 84, 4, C_WHITE, C_BG, TC_DATUM);
+  text("Connecting WiFi...", UI_CX, 124, 2, C_GREY, C_BG, TC_DATUM);
 }
 
 static void drawPortal() {
   tft.fillScreen(C_BG);
-  text("WiFi SETUP", 120, 18, 4, C_AMBER, C_BG, TC_DATUM);
-  text("1. Join this WiFi:", 20, 64, 2, C_GREY, C_BG);
-  text(PORTAL_AP_NAME, 20, 84, 4, C_WHITE, C_BG);
-  text("2. Open in browser:", 20, 124, 2, C_GREY, C_BG);
-  text("192.168.4.1", 20, 144, 4, C_WHITE, C_BG);
-  text("3. Pick your home WiFi", 20, 190, 2, C_GREY, C_BG);
+  text("WiFi SETUP", UI_CX, 44, 4, C_AMBER, C_BG, TC_DATUM);
+  text("1. Join this WiFi:", UI_CX, 76, 2, C_GREY, C_BG, TC_DATUM);
+  text(PORTAL_AP_NAME, UI_CX, 94, 4, C_WHITE, C_BG, TC_DATUM);
+  text("2. Open in browser:", UI_CX, 124, 2, C_GREY, C_BG, TC_DATUM);
+  text("192.168.4.1", UI_CX, 142, 4, C_WHITE, C_BG, TC_DATUM);
+  text("3. Pick home WiFi", UI_CX, 176, 2, C_GREY, C_BG, TC_DATUM);
 }
 
 static void drawNoHost() {
   tft.fillScreen(C_BG);
-  text("WiFi connected", 120, 18, 4, C_GREEN, C_BG, TC_DATUM);
-  text("Open in browser:", 20, 72, 2, C_GREY, C_BG);
-  text(WiFi.localIP().toString(), 20, 92, 4, C_WHITE, C_BG);
-  text("or " MDNS_NAME ".local", 20, 130, 2, C_GREY, C_BG);
-  text("Then enter the", 20, 176, 2, C_GREY, C_BG);
-  text("printer IP address", 20, 194, 2, C_GREY, C_BG);
+  String ip = WiFi.localIP().toString();
+  text("WiFi connected", UI_CX, 42, 4, C_GREEN, C_BG, TC_DATUM);
+  text("Open in browser:", UI_CX, 78, 2, C_GREY, C_BG, TC_DATUM);
+  text(ip, UI_CX, 98, tft.textWidth(ip, 4) <= 170 ? 4 : 2, C_WHITE, C_BG, TC_DATUM);
+  text("or " MDNS_NAME ".local", UI_CX, 130, 2, C_GREY, C_BG, TC_DATUM);
+  text("Then enter the", UI_CX, 158, 2, C_GREY, C_BG, TC_DATUM);
+  text("printer IP", UI_CX, 176, 2, C_GREY, C_BG, TC_DATUM);
 }
 
 static void drawWifiLost() {
   tft.fillScreen(C_BG);
-  text("WiFi lost", 120, 90, 4, C_RED, C_BG, TC_DATUM);
-  text("Reconnecting...", 120, 130, 2, C_GREY, C_BG, TC_DATUM);
+  text("WiFi lost", UI_CX, 88, 4, C_RED, C_BG, TC_DATUM);
+  text("Reconnecting...", UI_CX, 126, 2, C_GREY, C_BG, TC_DATUM);
 }
 
 static void setScreen(Screen s) {
@@ -733,122 +692,99 @@ static bool slotsEqual(const Data &a, const Data &b) {
   return true;
 }
 
-static inline bool vis(int y0, int y1) { return y1 > curStripY && y0 < curStripY + STRIP_H; }
-
-// 縮圖（84x84，從暫存檔逐列讀出，透明像素 0x0001 跳過）
+// 縮圖（72x72，從暫存檔逐列讀出，透明像素 0x0001 跳過）
+#define THUMB_X 38
+#define THUMB_Y 78
 static void drawThumbImage() {
-  const int X = 30, Y = 72;
   if (!tf) tf = LittleFS.open(THUMB_FILE, "r");
   if (!tf) return;
-  int y0 = Y > curStripY ? Y : curStripY;
-  int y1 = (Y + THUMB_H < curStripY + STRIP_H) ? Y + THUMB_H : curStripY + STRIP_H;
   uint8_t line[THUMB_W * 2];
-  for (int y = y0; y < y1; y++) {
-    if (!tf.seek((uint32_t)(y - Y) * THUMB_W * 2, SeekSet)) return;
+  for (int y = 0; y < THUMB_H; y++) {
+    if (!tf.seek((uint32_t)y * THUMB_W * 2, SeekSet)) return;
     if (tf.read(line, sizeof(line)) != sizeof(line)) return;
     for (int x = 0; x < THUMB_W; x++) {
       uint16_t v = line[x * 2] | (line[x * 2 + 1] << 8);
-      if (v != TD_TRANSP) gPixel(X + x, y, v);
+      if (v != TD_TRANSP) gPixel(THUMB_X + x, THUMB_Y + y, v);
     }
   }
 }
 
 // 右側的小卡片：圖示 + 數值（右對齊）；數值太寬就自動改小字
 static void miniCard(int y, int kind, uint16_t col, const String &val, bool deg) {
-  const int x = 122, w = 90, h = 33;
-  if (!vis(y, y + h)) return;
+  const int x = 118, w = 78, h = 27;
   gCard(x, y, w, h, 9);
-  if (kind == 0) iconClock(x + 8, y + 9, col);
-  else if (kind == 1) iconNozzle(x + 8, y + 9, col);
-  else iconBed(x + 8, y + 9, col);
+  if (kind == 0) iconClock(x + 8, y + 6, col);
+  else if (kind == 1) iconNozzle(x + 8, y + 6, col);
+  else iconBed(x + 8, y + 6, col);
   int right = x + w - 8 - (deg ? 7 : 0);
   int avail = right - (x + 8 + 14 + 4);
   int font = tft.textWidth(val, 4) <= avail ? 4 : 2;
-  gText(val, right, y + (font == 4 ? 3 : 8), font, C_WHITE, TR_DATUM);
-  if (deg) gCircleO(right + 4, y + 9, 2, C_WHITE);
+  gText(val, right, y + (font == 4 ? 1 : 6), font, C_WHITE, TR_DATUM);
+  if (deg) gCircleO(right + 4, y + 8, 2, C_WHITE);
 }
 
-// 把所有前景元素畫到目前的繪圖目標；不在這一條橫帶範圍內的元素直接跳過
+// 圓形版面（圓心 116,116；內圈半徑 102，內容盡量留在半徑 96 內）：
+//  上：狀態列、檔名（置中）｜中：左縮圖卡片 + 右三張小卡片｜下：四個卡槽圓點 + 使用中卡槽的材質
 static void drawForeground() {
-  if (vis(22, 40)) {  // 狀態列：圓點 + 狀態（底線）+ 右上角小字顯示小電視自己的 IP
-    gCircle(34, 31, 5, cur.stateColor);
-    gText(cur.state, 44, 23, 2, C_WHITE);
-    gLine(44, 38, 44 + tft.textWidth(cur.state, 2), 38, C_WHITE);
-    gText(WiFi.localIP().toString(), 212, 27, 1, C_GREY, TR_DATUM);
+  {  // 狀態列：圓點 + 狀態文字，整組置中
+    int font = 2;
+    int tw = tft.textWidth(cur.state, font);
+    if (tw + 16 > 92) { font = 1; tw = tft.textWidth(cur.state, font); }
+    int x0 = UI_CX - (16 + tw) / 2;
+    gCircle(x0 + 5, 40, 5, cur.stateColor);
+    gText(cur.state, x0 + 16, font == 2 ? 32 : 36, font, C_WHITE);
   }
-  if (vis(40, 56)) {  // 檔名（去掉 .gcode，太長就截斷加 ..）
+  {  // 檔名（去掉 .gcode，太長就截斷加 ..），置中
     String fn = cur.filename;
     if (fn.endsWith(".gcode")) fn.remove(fn.length() - 6);
     bool cut = false;
-    while (fn.length() > 1 && tft.textWidth(fn + (cut ? ".." : ""), 2) > 184) {
+    while (fn.length() > 1 && tft.textWidth(fn + (cut ? ".." : ""), 2) > 136) {
       fn.remove(fn.length() - 1);
       cut = true;
     }
-    gText(fn + (cut ? ".." : ""), 28, 41, 2, C_GREY);
+    gText(fn + (cut ? ".." : ""), UI_CX, 52, 2, C_GREY, TC_DATUM);
   }
-  if (vis(60, 168)) {  // 左：縮圖卡片
-    gCard(28, 60, 88, 108, 9);
+  {  // 左：縮圖卡片
+    gCard(36, 72, 76, 85, 9);
     bool showThumb = thumbOk && cur.state != "IDLE" && cur.state != "OFFLINE";
     if (showThumb) drawThumbImage();
-    else gText(cur.state == "IDLE" ? "NO JOB" : "NO IMG", 72, 108, 2, C_GREY, TC_DATUM);
+    else gText(cur.state == "IDLE" ? "NO JOB" : "NO IMG", 74, 107, 2, C_GREY, TC_DATUM);
   }
   // 右：剩餘時間、噴頭、熱床
-  miniCard(60, 0, C_GREY, fmtEta(cur.etaS), false);
-  miniCard(97, 1, C_ORANGE, cur.nozzle < 0 ? String("--") : String(cur.nozzle), cur.nozzle >= 0);
-  miniCard(134, 2, C_BLUE, cur.bed < 0 ? String("--") : String(cur.bed), cur.bed >= 0);
+  miniCard(72, 0, C_GREY, fmtEta(cur.etaS), false);
+  miniCard(101, 1, C_ORANGE, cur.nozzle < 0 ? String("--") : String(cur.nozzle), cur.nozzle >= 0);
+  miniCard(130, 2, C_BLUE, cur.bed < 0 ? String("--") : String(cur.bed), cur.bed >= 0);
 
-  if (vis(172, 222)) {  // 下：四個卡槽 + 材質，使用中的用白色粗框；卡片盡量貼近底部
-    gCard(28, 172, 184, 47, 9);   // 卡片 y 172~218，底下留 3 列（219~221）的縫給外圈
+  {  // 下：四個卡槽圓點（使用中的用白色粗框），下方顯示使用中卡槽的名稱與材質
+    const int cy = 172;
     for (int i = 0; i < 4; i++) {
-      int x = 32 + (i * 138) / 3;
-      const int y = 178;
+      int cx = UI_CX - 48 + i * 32;
       bool act = (i == cur.active);
-      String name = String("1") + (char)('A' + i);
+      String letter = String((char)('A' + i));
       if (cur.slots[i].has) {
-        uint16_t col = slotColor565(cur.slots[i].rgb);
-        gRRect(x, y, 38, 22, 5, col);
-        if (act) {
-          gRRectO(x, y, 38, 22, 5, C_WHITE);
-          gRRectO(x + 1, y + 1, 36, 20, 4, C_WHITE);
-        } else {
-          gRRectO(x, y, 38, 22, 5, C_BORDER);
-        }
-        gText(name, x + 19, y + 3, 2, textOn(cur.slots[i].rgb), TC_DATUM);
-        gText(String(cur.slots[i].mat), x + 19, y + 24, 2, act ? C_WHITE : C_GREY, TC_DATUM);
+        gCircle(cx, cy, 11, slotColor565(cur.slots[i].rgb));
+        if (act) { gCircleO(cx, cy, 12, C_WHITE); gCircleO(cx, cy, 11, C_WHITE); }
+        else gCircleO(cx, cy, 11, C_BORDER);
+        gText(letter, cx, cy - 8, 2, textOn(cur.slots[i].rgb), TC_DATUM);
       } else {
-        gRRect(x, y, 38, 22, 5, C_EMPTY);
-        gRRectO(x, y, 38, 22, 5, C_BORDER);
-        gLine(x + 13, y + 18, x + 25, y + 4, C_GREY);
-        gText("--", x + 19, y + 24, 2, C_GREY, TC_DATUM);
+        gCircle(cx, cy, 11, C_EMPTY);
+        gCircleO(cx, cy, 11, C_BORDER);
+        gLine(cx - 5, cy + 5, cx + 5, cy - 5, C_GREY);
       }
+    }
+    if (cur.active >= 0 && cur.active < 4 && cur.slots[cur.active].has) {
+      String lab = String("1") + (char)('A' + cur.active) + " " + cur.slots[cur.active].mat;
+      gText(lab, UI_CX, 188, 2, C_WHITE, TC_DATUM);
     }
   }
 }
 
-// 組合並推送一條橫帶（y0 起算 25 列）：背景 → 背景大數字 → 前景，全部在離屏畫好後一次推上螢幕，
-// 螢幕上的每個像素都是「舊畫面 → 新畫面」直接替換，中間不會出現被清空的狀態，所以不閃
-static void composeStrip(int y0) {
-  curStripY = y0;
-  if (sprOk) {
-    useSpr = true;
-    ox = STRIP_X;
-    oy = y0;
-    spr.fillSprite(C_BG);
-    drawBgNumber();
-    drawForeground();
-    spr.pushToSprite(&tft, STRIP_X, y0);
-    markDirty();
-  } else {  // 記憶體不夠建 sprite 時的備援：直接畫在螢幕上，用 viewport 限制只畫這一條
-    useSpr = false;
-    ox = 0;
-    oy = 0;
-    tft.setViewport(STRIP_X, y0, STRIP_W, STRIP_H, false);
-    tft.fillRect(STRIP_X, y0, STRIP_W, STRIP_H, C_BG);
-    drawBgNumber();
-    drawForeground();
-    tft.resetViewport();
-    markDirty();
-  }
+// 內圈整塊重畫（背景 → 背景大數字 → 前景）；整張畫布一次推上螢幕，所以不會閃
+static void composeContent() {
+  tft.fillCircle(UI_CX, UI_CY, (int)RING_R - RING_PEN - 1, C_BG);
+  drawBgNumber();
+  drawForeground();
+  markDirty();
 }
 
 static void renderDash() {
@@ -860,7 +796,7 @@ static void renderDash() {
   static int shownNum = -2;
   static int shownThumbVer = -1;
 
-  // 外圈進度條（直接畫在螢幕上，只補畫新增的那一小段）
+  // 外圈進度條（只補畫新增的那一小段）
   float len = constrain(cur.progress, 0.0f, 1.0f) * RING_TOTAL;
   if (force || cur.stateColor != shown.stateColor || len < shownLen - 1) {
     drawRing(0, RING_TOTAL, C_TRACK);
@@ -871,30 +807,13 @@ static void renderDash() {
     shownLen = len;
   }
 
-  // 找出哪幾條橫帶需要重畫
-  uint8_t dirty = 0;
-  auto mark = [&](int y0, int y1) {
-    for (int k = 0; k < STRIP_N; k++) {
-      int s0 = STRIP_Y0 + k * STRIP_H, s1 = s0 + STRIP_H - 1;
-      if (y1 >= s0 && y0 <= s1) dirty |= (1 << k);
-    }
-  };
-  if (force || num != shownNum) {
-    dirty = 0xFF;  // 背景數字變了：整個中央區域重畫（逐條推送，不閃）
-  } else {
-    if (cur.state != shown.state) mark(22, 40);
-    if (cur.filename != shown.filename) mark(40, 56);
-    if (cur.etaS != shown.etaS) mark(60, 93);
-    if (cur.nozzle != shown.nozzle) mark(97, 130);
-    if (cur.bed != shown.bed) mark(134, 167);
-    if (!slotsEqual(cur, shown)) mark(172, 221);
-    if (thumbVer != shownThumbVer) mark(60, 168);
-  }
+  bool changed = force || num != shownNum || cur.state != shown.state || cur.stateColor != shown.stateColor ||
+                 cur.filename != shown.filename || cur.etaS != shown.etaS || cur.nozzle != shown.nozzle ||
+                 cur.bed != shown.bed || !slotsEqual(cur, shown) || thumbVer != shownThumbVer;
   bgNum = num;
   shownNum = num;
   shownThumbVer = thumbVer;
-  for (int k = 0; k < STRIP_N; k++)
-    if (dirty & (1 << k)) { composeStrip(STRIP_Y0 + k * STRIP_H); yield(); }
+  if (changed) composeContent();
 
   shown = cur;
   shownValid = true;
@@ -941,7 +860,7 @@ static void animateFlow() {
   for (float sp = a0; sp <= a1; sp += 2.0f) {
     float t = (sp - (newHead - L)) / L;   // 0 尾 → 1 頭
     ringPoint(sp, x, y);
-    tft.fillCircle(x, y, 8, tint(cur.stateColor, (uint8_t)(40 + 190 * t)));
+    tft.fillCircle(x, y, RING_PEN, tint(cur.stateColor, (uint8_t)(40 + 190 * t)));
   }
   flowHead = newHead;
   markDirty();
@@ -1453,11 +1372,10 @@ void setup() {
   setBacklight(brightPct);
 
   tft.setColorDepth(16);
-  bool canvasOk = tft.createSprite(240, 240) != nullptr;
-  sprOk = spr.createSprite(STRIP_W, STRIP_H) != nullptr;
+  bool canvasOk = tft.createSprite(UI_W, UI_W) != nullptr;
   bool outOk = presentInit();
-  Serial.printf("canvas %s, strip %s, out %s, free heap %u, free psram %u\n",
-                canvasOk ? "ok" : "FAILED", sprOk ? "ok" : "FAILED", outOk ? "ok" : "FAILED",
+  Serial.printf("canvas %s, out %s, free heap %u, free psram %u\n",
+                canvasOk ? "ok" : "FAILED", outOk ? "ok" : "FAILED",
                 (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
   tft.fillScreen(C_BG);
   setScreen(SCR_BOOT);
